@@ -4,10 +4,13 @@ mod differ;
 mod engine;
 mod graph;
 mod parser;
+mod paths;
 mod rate;
+mod resolver;
 mod rippler;
 mod state;
 mod view;
+mod walker;
 mod watcher;
 mod writer;
 
@@ -32,6 +35,31 @@ enum Commands {
         #[arg(short, long, default_value = "20")]
         limit: usize,
     },
+    /// Show dependency graph for a file: what it imports and what imports it
+    Deps {
+        /// File path to inspect (relative to project root)
+        file: PathBuf,
+        #[arg(short, long, default_value = "2")]
+        depth: u8,
+        /// Output as JSON (easier for agents to parse)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Brief context for a file — designed for hook injection into AI agents
+    Brief {
+        /// File path to get context for
+        file: PathBuf,
+        /// Max characters to output (default 500)
+        #[arg(short, long, default_value = "500")]
+        budget: usize,
+    },
+    /// Register a worker trail: what files were touched and by whom
+    Touch {
+        /// Files that were created or modified
+        files: Vec<PathBuf>,
+        #[arg(short, long)]
+        worker: Option<String>,
+    },
 }
 
 fn main() {
@@ -46,6 +74,9 @@ fn main() {
         Commands::Status => cmd_status(project_root),
         Commands::View => cmd_view(project_root),
         Commands::Log { limit } => cmd_log(project_root, limit),
+        Commands::Deps { file, depth, json } => cmd_deps(project_root, file, depth, json),
+        Commands::Brief { file, budget } => cmd_brief(project_root, file, budget),
+        Commands::Touch { files, worker } => cmd_touch(project_root, files, worker),
     }
 }
 
@@ -60,6 +91,8 @@ fn cmd_init(root: PathBuf) {
 
     std::fs::create_dir_all(&ctx_dir).expect("failed to create .ctx/");
     std::fs::create_dir_all(ctx_dir.join("archive")).expect("failed to create .ctx/archive/");
+    config::CtxConfig::write_default_config(&ctx_dir);
+    state::write_default_nest(&cfg);
 
     let mut st = state::CtxState::new();
     let symbols_found = engine::full_scan(&cfg, &mut st);
@@ -148,7 +181,7 @@ fn cmd_status(root: PathBuf) {
     let st = state::load(&cfg);
     let symbol_count = st.symbols.len();
     let log_count = st.log.len();
-    let hot_count = st.symbols.values().filter(|s| s.trail_strength > 0.5).count();
+    let hot_count = st.symbols.values().filter(|s| s.total_heat() > 0.5).count();
 
     println!("project: {}", root.file_name().unwrap_or_default().to_string_lossy());
     println!("daemon:  {}", if running { "running" } else { "stopped" });
@@ -212,6 +245,279 @@ fn trail_dots(strength: f64) -> String {
     let filled = (strength * 5.0).min(5.0) as usize;
     let empty = 5 - filled;
     format!("{}{}", "●".repeat(filled), "○".repeat(empty))
+}
+
+fn cmd_brief(root: PathBuf, file: PathBuf, budget: usize) {
+    let cfg = config::CtxConfig::new(root.clone());
+    let ctx_dir = root.join(".ctx");
+
+    if !ctx_dir.exists() {
+        return;
+    }
+
+    let st = state::load(&cfg);
+    let abs_file = if file.is_absolute() { file } else { root.join(&file) };
+    let rel_str = abs_file.strip_prefix(&root).unwrap_or(&abs_file).display().to_string();
+    let now = chrono::Utc::now().timestamp();
+
+    let last_write = rate::file_last_write(&st.file_rates, &abs_file);
+    let secs_ago = last_write.map(|t| now - t);
+    let writes_1m = rate::file_writes_last_n_secs(&st.file_rates, &abs_file, 60);
+    let activity = rate::file_activity_label(writes_1m);
+
+    let has_recent_activity = secs_ago.map_or(false, |s| s <= 300);
+
+    let file_symbols: Vec<_> = st.symbols.values()
+        .filter(|s| s.file == abs_file)
+        .collect();
+
+    let imports = st.graph.imports_of(&abs_file);
+    let dependents = st.graph.dependents_of(&abs_file);
+
+    let nearby_active: Vec<_> = imports.iter().chain(dependents.iter())
+        .filter_map(|dep| {
+            let dep_last = rate::file_last_write(&st.file_rates, dep)?;
+            let dep_ago = now - dep_last;
+            if dep_ago <= 300 {
+                let dep_rel = dep.strip_prefix(&root).unwrap_or(dep).display().to_string();
+                let dep_writes = rate::file_writes_last_n_secs(&st.file_rates, dep, 60);
+                Some((dep_rel, dep_ago, dep_writes))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if !has_recent_activity && nearby_active.is_empty() && file_symbols.is_empty() {
+        return;
+    }
+
+    let mut out = String::new();
+    use std::fmt::Write;
+
+    let _ = writeln!(out, "[ctx] {}", rel_str);
+
+    if has_recent_activity {
+        let ago = secs_ago.unwrap_or(0);
+        let ago_str = if ago < 60 { format!("{}s ago", ago) } else { format!("{}m ago", ago / 60) };
+        let indicator = if activity == "editing" { " ⚡" } else { "" };
+        let _ = writeln!(out, "  last_write:{}  writes_1m:{}  {}{}", ago_str, writes_1m, activity, indicator);
+    }
+
+    if !nearby_active.is_empty() {
+        let _ = writeln!(out, "  nearby active:");
+        for (dep, ago, w) in &nearby_active {
+            if out.len() >= budget { break; }
+            let ago_str = if *ago < 60 { format!("{}s", ago) } else { format!("{}m", ago / 60) };
+            let _ = writeln!(out, "    {} {}ago writes_1m:{}", dep, ago_str, w);
+        }
+    }
+
+    if !file_symbols.is_empty() && out.len() < budget {
+        let _ = writeln!(out, "  symbols:");
+        let mut sorted_syms: Vec<_> = file_symbols.iter().collect();
+        sorted_syms.sort_by(|a, b| b.total_heat().partial_cmp(&a.total_heat()).unwrap_or(std::cmp::Ordering::Equal));
+        for sym in sorted_syms {
+            if out.len() >= budget { break; }
+            let dots = trail_dots(sym.total_heat());
+            let _ = writeln!(out, "    {} [{}] {} touches:{}", sym.name, sym.kind, dots, sym.touch_count);
+        }
+    }
+
+    out.truncate(budget);
+    print!("{}", out);
+}
+
+fn cmd_deps(root: PathBuf, file: PathBuf, depth: u8, json: bool) {
+    let cfg = config::CtxConfig::new(root.clone());
+    let ctx_dir = root.join(".ctx");
+
+    if !ctx_dir.exists() {
+        eprintln!("Not a ctx project. Run `ctx init` first.");
+        std::process::exit(1);
+    }
+
+    let st = state::load(&cfg);
+    let abs_file = if file.is_absolute() {
+        file
+    } else {
+        root.join(&file)
+    };
+
+    let imports = st.graph.imports_of(&abs_file);
+    let dependents = st.graph.transitive_dependents(&abs_file, depth);
+
+    let file_symbols: Vec<_> = st.symbols.values()
+        .filter(|s| s.file == abs_file)
+        .collect();
+
+    let rel_str = abs_file.strip_prefix(&root).unwrap_or(&abs_file).display().to_string();
+    let recent_logs: Vec<_> = st.log.iter()
+        .filter(|e| e.path.contains(&rel_str) || e.rippled_to.iter().any(|r| r.contains(&rel_str)))
+        .rev()
+        .take(5)
+        .collect();
+
+    if json {
+        let output = serde_json::json!({
+            "file": rel_str,
+            "symbols": file_symbols.iter().map(|s| serde_json::json!({
+                "name": s.name,
+                "kind": s.kind,
+                "heat": s.total_heat(),
+                "direct_heat": s.trail_strength,
+                "ripple_heat": s.ripple_strength,
+                "touches": s.touch_count,
+                "line": s.line,
+            })).collect::<Vec<_>>(),
+            "imports": imports.iter().map(|imp| {
+                let rel = imp.strip_prefix(&root).unwrap_or(imp).display().to_string();
+                let heat: f64 = st.symbols.values()
+                    .filter(|s| s.file == *imp)
+                    .map(|s| s.total_heat()).sum();
+                serde_json::json!({"file": rel, "heat": heat})
+            }).collect::<Vec<_>>(),
+            "depended_on_by": dependents.iter().map(|(dep, d)| {
+                let rel = dep.strip_prefix(&root).unwrap_or(dep).display().to_string();
+                let heat: f64 = st.symbols.values()
+                    .filter(|s| s.file == *dep)
+                    .map(|s| s.total_heat()).sum();
+                serde_json::json!({"file": rel, "depth": d, "heat": heat})
+            }).collect::<Vec<_>>(),
+            "recent_activity": recent_logs.iter().map(|e| {
+                serde_json::json!({
+                    "timestamp": e.timestamp,
+                    "op": e.op,
+                    "detail": e.detail,
+                    "rippled_to": e.rippled_to,
+                })
+            }).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        return;
+    }
+
+    println!("file: {}", rel_str);
+    println!();
+
+    if !file_symbols.is_empty() {
+        println!("symbols:");
+        for sym in &file_symbols {
+            let dots = trail_dots(sym.total_heat());
+            println!("  {} [{}] {} touches:{}", sym.name, sym.kind, dots, sym.touch_count);
+        }
+        println!();
+    }
+
+    if !imports.is_empty() {
+        println!("imports ({}):", imports.len());
+        for imp in &imports {
+            let rel = imp.strip_prefix(&root).unwrap_or(imp);
+            let heat: f64 = st.symbols.values()
+                .filter(|s| s.file == *imp)
+                .map(|s| s.total_heat())
+                .sum();
+            println!("  {} heat:{:.1}", rel.display(), heat);
+        }
+        println!();
+    }
+
+    if !dependents.is_empty() {
+        println!("depended on by ({}):", dependents.len());
+        for (dep, dep_depth) in &dependents {
+            let rel = dep.strip_prefix(&root).unwrap_or(dep);
+            let heat: f64 = st.symbols.values()
+                .filter(|s| s.file == *dep)
+                .map(|s| s.total_heat())
+                .sum();
+            let indent = "  ".repeat(*dep_depth as usize);
+            println!("{}{}  depth:{} heat:{:.1}", indent, rel.display(), dep_depth, heat);
+        }
+        println!();
+    }
+
+    if !recent_logs.is_empty() {
+        println!("recent activity:");
+        for entry in &recent_logs {
+            let dt = chrono::DateTime::from_timestamp(entry.timestamp, 0)
+                .map(|d| d.format("%m-%dT%H:%M").to_string())
+                .unwrap_or_default();
+            println!("  {} {} {}", dt, entry.op, entry.detail);
+        }
+    }
+}
+
+fn cmd_touch(root: PathBuf, files: Vec<PathBuf>, worker: Option<String>) {
+    let cfg = config::CtxConfig::new(root.clone());
+    let ctx_dir = root.join(".ctx");
+
+    if !ctx_dir.exists() {
+        eprintln!("Not a ctx project. Run `ctx init` first.");
+        std::process::exit(1);
+    }
+
+    let trails_dir = ctx_dir.join("trails");
+    std::fs::create_dir_all(&trails_dir).expect("failed to create .ctx/trails/");
+
+    let now = chrono::Utc::now();
+    let worker_id = worker.unwrap_or_else(|| format!("worker-{}", now.timestamp_millis() % 10000));
+
+    // Load state and process each file
+    let mut st = state::load(&cfg);
+    let mut touched_symbols = Vec::new();
+    let mut rippled_all = Vec::new();
+
+    for file in &files {
+        let abs_file = if file.is_absolute() {
+            file.clone()
+        } else {
+            root.join(file)
+        };
+
+        // Re-parse the file to pick up new/changed symbols
+        engine::process_file_change(&cfg, &mut st, &abs_file);
+
+        // Collect symbols in this file
+        let syms: Vec<String> = st.symbols.values()
+            .filter(|s| s.file == abs_file)
+            .map(|s| s.fqn.clone())
+            .collect();
+        touched_symbols.extend(syms);
+
+        // Get what rippled
+        let dependents = st.graph.transitive_dependents(&abs_file, cfg.max_ripple_depth);
+        for (dep, _) in &dependents {
+            let rel = dep.strip_prefix(&root).unwrap_or(dep).display().to_string();
+            if !rippled_all.contains(&rel) {
+                rippled_all.push(rel);
+            }
+        }
+    }
+
+    // Save updated state
+    state::save(&cfg, &st);
+    writer::write_project_ctx(&cfg, &st);
+
+    // Write trail file
+    let trail = serde_json::json!({
+        "worker": worker_id,
+        "timestamp": now.to_rfc3339(),
+        "files": files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>(),
+        "symbols_touched": touched_symbols,
+        "rippled_to": rippled_all,
+    });
+
+    let trail_file = trails_dir.join(format!("{}.json", worker_id));
+    std::fs::write(&trail_file, serde_json::to_string_pretty(&trail).unwrap())
+        .expect("failed to write trail");
+
+    // Print summary
+    println!("trail: {}", worker_id);
+    println!("  touched: {} files, {} symbols", files.len(), touched_symbols.len());
+    if !rippled_all.is_empty() {
+        println!("  rippled to: {}", rippled_all.join(", "));
+    }
+    println!("  saved: {}", trail_file.strip_prefix(&root).unwrap_or(&trail_file).display());
 }
 
 fn is_process_alive(pid: i32) -> bool {

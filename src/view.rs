@@ -152,7 +152,7 @@ fn draw(f: &mut Frame, app: &App) {
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let sym_count = app.state.symbols.len();
     let log_count = app.state.log.len();
-    let hot_count = app.state.symbols.values().filter(|s| s.trail_strength > 0.5).count();
+    let hot_count = app.state.symbols.values().filter(|s| s.total_heat() > 0.5).count();
     let status = if app.running_daemon { "▶ running" } else { "■ stopped" };
     let status_color = if app.running_daemon { Color::Green } else { Color::Red };
 
@@ -257,7 +257,7 @@ fn draw_symbols_panel(f: &mut Frame, area: Rect, app: &App) {
     let end = (start + visible).min(symbols.len());
 
     let items: Vec<ListItem> = symbols[start..end].iter().map(|sym| {
-        let dots = trail_dots(sym.trail_strength);
+        let dots = trail_dots(sym.total_heat());
         let kind_color = match sym.kind.as_str() {
             "type" => Color::Yellow,
             "function" => Color::Green,
@@ -443,9 +443,9 @@ fn build_module_list(state: &CtxState) -> Vec<ModuleInfo> {
             symbols: Vec::new(),
         });
         info.sym_count += 1;
-        info.total_strength += sym.trail_strength;
-        if sym.trail_strength > info.max_strength {
-            info.max_strength = sym.trail_strength;
+        info.total_strength += sym.total_heat();
+        if sym.total_heat() > info.max_strength {
+            info.max_strength = sym.total_heat();
         }
         info.symbols.push(sym.clone());
     }
@@ -453,7 +453,7 @@ fn build_module_list(state: &CtxState) -> Vec<ModuleInfo> {
     for (name, info) in modules.iter_mut() {
         info.wph = rate::writes_per_hour(&state.rates, name);
         info.symbols.sort_by(|a, b| {
-            b.trail_strength.partial_cmp(&a.trail_strength).unwrap_or(std::cmp::Ordering::Equal)
+            b.total_heat().partial_cmp(&a.total_heat()).unwrap_or(std::cmp::Ordering::Equal)
         });
     }
 

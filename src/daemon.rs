@@ -72,7 +72,7 @@ fn run_loop(cfg: CtxConfig) {
         }
 
         if last_decay.elapsed() >= decay_interval {
-            engine::decay_all(&mut st, cfg.decay_factor, cfg.compaction_threshold);
+            st.decay_all(cfg.decay_factor);
             writer::write_project_ctx(&cfg, &st);
             state::save(&cfg, &st);
             last_decay = Instant::now();
@@ -80,6 +80,7 @@ fn run_loop(cfg: CtxConfig) {
 
         if last_rate_cleanup.elapsed() >= rate_cleanup_interval {
             rate::cleanup(&mut st.rates);
+            rate::cleanup_file_rates(&mut st.file_rates);
             last_rate_cleanup = Instant::now();
         }
     }

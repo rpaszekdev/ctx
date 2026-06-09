@@ -9,12 +9,14 @@ pub fn ripple(state: &mut CtxState, changed_file: &PathBuf, base_boost: f64, max
         let attenuation = 0.5_f64.powi(depth as i32);
         let boost = base_boost * attenuation;
 
-        for sym in state.symbols.values_mut() {
-            if sym.file == dep_file {
-                sym.trail_strength = (sym.trail_strength + boost).min(5.0);
-                sym.last_touched = chrono::Utc::now().timestamp();
-                rippled.push(sym.fqn.clone());
-            }
+        let fqns: Vec<String> = state.symbols.values()
+            .filter(|s| s.file == dep_file)
+            .map(|s| s.fqn.clone())
+            .collect();
+
+        for fqn in fqns {
+            state.boost_ripple(&fqn, boost);
+            rippled.push(fqn);
         }
     }
 

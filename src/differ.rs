@@ -1,4 +1,5 @@
 use crate::parser;
+use crate::paths;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -31,14 +32,7 @@ pub struct SymbolChange {
 
 pub fn diff_file(old: Option<&str>, new: Option<&str>, file_path: &Path, project_root: &Path) -> Vec<SymbolChange> {
     let rel = file_path.strip_prefix(project_root).unwrap_or(file_path);
-    let arch_path = rel.to_string_lossy()
-        .replace('\\', "/")
-        .trim_start_matches("src/")
-        .trim_end_matches(".ts").trim_end_matches(".tsx")
-        .trim_end_matches(".js").trim_end_matches(".jsx")
-        .trim_end_matches(".rs").trim_end_matches(".py")
-        .trim_end_matches(".go")
-        .to_string();
+    let arch_path = paths::to_arch_path(rel);
 
     match (old, new) {
         (None, Some(new_src)) => {
@@ -73,7 +67,7 @@ pub fn diff_file(old: Option<&str>, new: Option<&str>, file_path: &Path, project
                         fqn, name: name.clone(), kind: ns.kind.clone(), line: ns.line,
                         diff_kind: DiffKind::Added, detail: format!("added {}", ns.kind),
                     }),
-                    Some(os) if os.line != ns.line => changes.push(SymbolChange {
+                    Some(os) if os.body_hash != ns.body_hash => changes.push(SymbolChange {
                         fqn, name: name.clone(), kind: ns.kind.clone(), line: ns.line,
                         diff_kind: DiffKind::Modified, detail: "modified".into(),
                     }),
