@@ -14,6 +14,7 @@ fn render(cfg: &CtxConfig, state: &CtxState) -> String {
     let mut out = String::with_capacity(8192);
 
     write_nest(&mut out, &state.nest);
+    write_active(&mut out, cfg, state);
     write_arch(&mut out, cfg, state);
     write_symbols(&mut out, state);
     write_log(&mut out, state);
@@ -25,6 +26,45 @@ fn write_nest(out: &mut String, nest: &str) {
     out.push_str("---NEST\n");
     out.push_str(nest);
     out.push_str("\n---\n\n");
+}
+
+fn write_active(out: &mut String, cfg: &CtxConfig, state: &CtxState) {
+    let now = chrono::Utc::now().timestamp();
+    let mut active_files: Vec<_> = state.file_rates.iter()
+        .filter_map(|(file, timestamps)| {
+            let writes_1m = timestamps.iter().filter(|&&t| t > now - 60).count();
+            let last_write = timestamps.last().copied().unwrap_or(0);
+            let secs_ago = now - last_write;
+            if secs_ago <= 300 {
+                let rel = file.strip_prefix(&cfg.project_root).unwrap_or(file);
+                let label = rate::file_activity_label(writes_1m);
+                Some((rel.to_path_buf(), secs_ago, writes_1m, label))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if active_files.is_empty() {
+        return;
+    }
+
+    active_files.sort_by_key(|(_, secs_ago, _, _)| *secs_ago);
+
+    out.push_str("---ACTIVE\n");
+    for (file, secs_ago, writes_1m, label) in &active_files {
+        let ago = if *secs_ago < 60 {
+            format!("{}s ago", secs_ago)
+        } else {
+            format!("{}m ago", secs_ago / 60)
+        };
+        let indicator = if *label == "editing" { " ⚡" } else { "" };
+        let _ = std::fmt::Write::write_fmt(out, format_args!(
+            "{}  last_write:{}  writes_1m:{}  {}{}\n",
+            file.display(), ago, writes_1m, label, indicator
+        ));
+    }
+    out.push_str("---\n\n");
 }
 
 fn write_arch(out: &mut String, _cfg: &CtxConfig, state: &CtxState) {
@@ -44,24 +84,24 @@ fn write_arch(out: &mut String, _cfg: &CtxConfig, state: &CtxState) {
     module_list.sort_by(|a, b| {
         let a_wph = rate::writes_per_hour(&state.rates, &a.0);
         let b_wph = rate::writes_per_hour(&state.rates, &b.0);
-        let a_strength: f64 = state.symbols.values()
+        let a_heat: f64 = state.symbols.values()
             .filter(|s| s.fqn.starts_with(&format!("{}/", a.0)))
-            .map(|s| s.trail_strength).sum();
-        let b_strength: f64 = state.symbols.values()
+            .map(|s| s.total_heat()).sum();
+        let b_heat: f64 = state.symbols.values()
             .filter(|s| s.fqn.starts_with(&format!("{}/", b.0)))
-            .map(|s| s.trail_strength).sum();
+            .map(|s| s.total_heat()).sum();
         b_wph.cmp(&a_wph)
-            .then_with(|| b_strength.partial_cmp(&a_strength).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| b_heat.partial_cmp(&a_heat).unwrap_or(std::cmp::Ordering::Equal))
             .then_with(|| a.0.cmp(&b.0))
     });
 
     for (module, symbols) in &module_list {
         let wph = rate::writes_per_hour(&state.rates, module);
         let activity = rate::activity_label(wph);
-        let total_strength: f64 = state.symbols.values()
+        let total_heat: f64 = state.symbols.values()
             .filter(|s| s.fqn.starts_with(&format!("{}/", module)))
-            .map(|s| s.trail_strength).sum();
-        let _ = writeln!(out, "{}/  {}w/hr {} heat:{:.1}", module, wph, activity, total_strength);
+            .map(|s| s.total_heat()).sum();
+        let _ = writeln!(out, "{}/  {}w/hr {} heat:{:.1}", module, wph, activity, total_heat);
 
         for sym in symbols {
             let _ = writeln!(out, "  {}", sym);
@@ -76,7 +116,7 @@ fn write_symbols(out: &mut String, state: &CtxState) {
 
     let mut sorted: Vec<_> = state.symbols.values().collect();
     sorted.sort_by(|a, b| {
-        b.trail_strength.partial_cmp(&a.trail_strength)
+        b.total_heat().partial_cmp(&a.total_heat())
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| b.touch_count.cmp(&a.touch_count))
             .then_with(|| b.last_touched.cmp(&a.last_touched))
@@ -84,12 +124,17 @@ fn write_symbols(out: &mut String, state: &CtxState) {
     });
 
     for sym in sorted {
-        let dots = trail_dots(sym.trail_strength);
+        let direct = trail_dots(sym.trail_strength);
+        let ripple = if sym.ripple_strength > 0.1 {
+            format!(" ripple:{:.1}", sym.ripple_strength)
+        } else {
+            String::new()
+        };
         let date = chrono::DateTime::from_timestamp(sym.last_touched, 0)
             .map(|d| d.format("%b%e").to_string().to_lowercase().replace(' ', ""))
             .unwrap_or_default();
 
-        let _ = writeln!(out, "{} [{}] {} {}", sym.fqn, sym.kind, date, dots);
+        let _ = writeln!(out, "{} [{}] {} {}{}", sym.fqn, sym.kind, date, direct, ripple);
 
         if !sym.uses.is_empty() {
             let _ = writeln!(out, "  uses: {}", sym.uses.join(", "));
