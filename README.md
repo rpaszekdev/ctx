@@ -2,6 +2,13 @@
 
 **Codebase context tracker — like git for meaning.**
 
+[![Rust](https://img.shields.io/badge/rust-2021-000000?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![tests](https://img.shields.io/badge/tests-25%20passing-2ea44f)](#tests)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![status](https://img.shields.io/badge/status-v0.1%20early-orange)](#status)
+
+![ctx view — the live TUI: modules ranked by heat, symbols in the selected module, the attributed change log, and a per-module activity timeline](docs/images/ctx-view.png)
+
 `ctx` watches your codebase and tracks *where the work is happening* — which
 symbols are being edited, how that activity ripples through the import graph,
 and which code is "hot" right now. Git tracks what your code *is*; `ctx` tracks
@@ -121,11 +128,33 @@ src/
   writer.rs      generates .ctx/project.ctx summary
 ```
 
+## Tests
+
+```bash
+cargo test          # 25 tests
+```
+
+Coverage is uneven and worth knowing before you trust it: the import resolver is
+well covered (tsconfig `paths` walking, nearest-config resolution, comments and
+trailing commas in `tsconfig.json`), and `view` covers state refresh including
+torn reads. The heat model itself — `engine`, `differ`, `rippler`, `state` — is
+exercised end-to-end by hand but has no unit tests yet.
+
 ## Status
 
-v0.1 — early. TypeScript/JS has full symbol + import extraction; Rust, Python,
-and Go have symbol extraction (import resolution is currently TS/JS-focused).
+v0.1 — early, and used daily on this repo, but not published to crates.io.
+
+| Language | Symbols | Imports resolved |
+|---|---|---|
+| TypeScript / JS | ✅ | ✅ including `tsconfig` `paths` aliases |
+| Rust | ✅ | ✅ `use crate::…` and `mod` |
+| Python | ✅ | ✅ absolute and relative (`from .x import y`) |
+| Go | ✅ | ❌ needs `go.mod` to map an import path to a directory |
+
+Unresolvable specifiers (stdlib, third-party packages) are dropped rather than
+filtered by a maintained ignore list — they have no file in the project, so
+there is nothing for heat to ripple to.
 
 ## License
 
-Not yet specified.
+MIT — see [LICENSE](LICENSE).
