@@ -1,5 +1,7 @@
+use crate::config::CtxConfig;
 use crate::rate;
-use crate::state::{CtxState, LogEntry, TrackedSymbol};
+use crate::state::{self, CtxState, LogEntry, TrackedSymbol};
+use crate::trails;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
@@ -7,6 +9,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 use std::collections::BTreeMap;
 use std::io::stdout;
+use std::time::SystemTime;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Panel {
@@ -19,7 +22,10 @@ enum Panel {
 const PANELS: [Panel; 4] = [Panel::Modules, Panel::Symbols, Panel::Log, Panel::Timeline];
 
 struct App {
+    cfg: CtxConfig,
     state: CtxState,
+    trails: Vec<trails::Trail>,
+    last_mtime: Option<SystemTime>,
     running_daemon: bool,
     active_panel: usize,
     module_list: Vec<ModuleInfo>,
@@ -27,6 +33,10 @@ struct App {
     symbol_scroll: usize,
     log_scroll: usize,
     quit: bool,
+}
+
+fn state_mtime(cfg: &CtxConfig) -> Option<SystemTime> {
+    std::fs::metadata(cfg.ctx_path.join(".state")).ok()?.modified().ok()
 }
 
 #[derive(Clone)]
@@ -40,10 +50,15 @@ struct ModuleInfo {
 }
 
 impl App {
-    fn new(state: CtxState, running_daemon: bool) -> Self {
+    fn new(cfg: CtxConfig, state: CtxState, running_daemon: bool) -> Self {
         let module_list = build_module_list(&state);
+        let last_mtime = state_mtime(&cfg);
+        let worker_trails = trails::load(&cfg);
         Self {
+            cfg,
             state,
+            trails: worker_trails,
+            last_mtime,
             running_daemon,
             active_panel: 0,
             module_list,
@@ -52,6 +67,38 @@ impl App {
             log_scroll: 0,
             quit: false,
         }
+    }
+
+    /// Re-read `.state` when the daemon has rewritten it. Cheap enough to call
+    /// every tick: one `stat` unless the file actually moved.
+    fn refresh(&mut self) {
+        let mtime = state_mtime(&self.cfg);
+        if mtime == self.last_mtime {
+            return;
+        }
+        self.last_mtime = mtime;
+
+        // ponytail: the daemon writes .state non-atomically, so a torn read just
+        // fails to parse and we keep the current view until the next tick.
+        // Upgrade path: have save() write .state.tmp and rename it into place.
+        let Some(new_state) = state::try_load(&self.cfg) else { return };
+
+        // Trails are appended by workers on their own schedule; reload alongside
+        // state so attribution catches up with the changes it explains.
+        self.trails = trails::load(&self.cfg);
+
+        let selected = self.module_list.get(self.selected_module).map(|m| m.name.clone());
+        self.state = new_state;
+        self.module_list = build_module_list(&self.state);
+
+        // Modules re-sort as heat shifts — follow the selection by name, not index.
+        self.selected_module = selected
+            .and_then(|name| self.module_list.iter().position(|m| m.name == name))
+            .unwrap_or(0);
+
+        let sym_max = self.selected_module_symbols().len().saturating_sub(1);
+        self.symbol_scroll = self.symbol_scroll.min(sym_max);
+        self.log_scroll = self.log_scroll.min(self.state.log.len().saturating_sub(1));
     }
 
     fn selected_module_symbols(&self) -> &[TrackedSymbol] {
@@ -112,12 +159,12 @@ impl App {
     }
 }
 
-pub fn render_view(state: &CtxState, running: bool) {
+pub fn render_view(cfg: &CtxConfig, state: &CtxState, running: bool) {
     enable_raw_mode().expect("failed to enable raw mode");
     stdout().execute(EnterAlternateScreen).expect("failed to enter alternate screen");
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout())).expect("failed to create terminal");
 
-    let mut app = App::new(state.clone(), running);
+    let mut app = App::new(cfg.clone(), state.clone(), running);
 
     loop {
         terminal.draw(|f| draw(f, &app)).expect("failed to draw");
@@ -129,6 +176,8 @@ pub fn render_view(state: &CtxState, running: bool) {
                 }
             }
         }
+
+        app.refresh();
 
         if app.quit { break; }
     }
@@ -382,14 +431,29 @@ fn draw_right_panel(f: &mut Frame, area: Rect, app: &App) {
         };
 
         let short_path = entry.path.split('/').last().unwrap_or(&entry.path);
+        let worker = trails::attribute(&app.trails, &entry.path, entry.timestamp);
 
-        let line = Line::from(vec![
+        // Unattributed changes keep the full width; the worker tag only steals
+        // space from the path when there is actually a worker to name.
+        let path_width = if worker.is_some() { 10 } else { 16 };
+
+        let mut spans = vec![
             Span::styled(&dt, Style::default().fg(Color::DarkGray)),
             Span::raw(" "),
             Span::styled(&entry.op, Style::default().fg(op_color).bold()),
             Span::raw(" "),
-            Span::styled(truncate(short_path, 16).to_string(), Style::default().fg(Color::White)),
-        ]);
+            Span::styled(truncate(short_path, path_width).to_string(), Style::default().fg(Color::White)),
+        ];
+
+        if let Some(w) = worker {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                truncate(&w, 10).to_string(),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+
+        let line = Line::from(spans);
 
         f.render_widget(Paragraph::new(line), Rect::new(inner.x, inner.y + i as u16, inner.width, 1));
     }
@@ -470,12 +534,97 @@ fn heat_bar_str(strength: f64, width: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(empty))
 }
 
-fn trail_dots(strength: f64) -> String {
-    let filled = strength.clamp(0.0, 5.0) as usize;
-    let empty = 5 - filled;
-    format!("{}{}", "●".repeat(filled), "○".repeat(empty))
+/// Five buckets spanning the range heat actually occupies.
+///
+/// The old scale was `strength as usize`, which saturated at 1.0 — and every
+/// touched symbol starts at 1.0, so every row rendered five filled dots and the
+/// column carried no information. These thresholds are spread over the observed
+/// distribution instead, so a symbol edited once reads differently from one
+/// edited repeatedly.
+pub fn trail_dots(strength: f64) -> String {
+    let filled = match strength {
+        s if s >= 4.0 => 5,
+        s if s >= 2.5 => 4,
+        s if s >= 1.5 => 3,
+        s if s >= 0.75 => 2,
+        s if s > 0.0 => 1,
+        _ => 0,
+    };
+    format!("{}{}", "●".repeat(filled), "○".repeat(5 - filled))
 }
 
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max - 1]) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn scratch(name: &str) -> CtxConfig {
+        let root = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".ctx")).unwrap();
+        CtxConfig::new(root)
+    }
+
+    fn state_with(names: &[&str]) -> CtxState {
+        let mut st = CtxState::new();
+        for n in names {
+            st.add_symbol(
+                format!("app/mod/{}", n),
+                n.to_string(),
+                "function".into(),
+                PathBuf::from("src/mod.ts"),
+                1,
+                1.0,
+            );
+        }
+        st
+    }
+
+    #[test]
+    fn refresh_picks_up_daemon_writes() {
+        let cfg = scratch("ctx-view-refresh-test");
+        state::save(&cfg, &state_with(&["alpha"]));
+
+        let mut app = App::new(cfg.clone(), state::load(&cfg), true);
+        assert_eq!(app.state.symbols.len(), 1);
+
+        // Simulate the daemon recording a second symbol.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        state::save(&cfg, &state_with(&["alpha", "beta"]));
+
+        app.refresh();
+        assert_eq!(app.state.symbols.len(), 2, "refresh should reload .state");
+        assert_eq!(app.module_list.iter().map(|m| m.sym_count).sum::<usize>(), 2);
+    }
+
+    #[test]
+    fn refresh_is_a_noop_when_state_is_unchanged() {
+        let cfg = scratch("ctx-view-noop-test");
+        state::save(&cfg, &state_with(&["alpha"]));
+
+        let mut app = App::new(cfg.clone(), state::load(&cfg), true);
+        app.selected_module = 0;
+        app.log_scroll = 0;
+        app.refresh();
+
+        assert_eq!(app.state.symbols.len(), 1);
+    }
+
+    #[test]
+    fn refresh_keeps_current_view_on_a_torn_write() {
+        let cfg = scratch("ctx-view-torn-test");
+        state::save(&cfg, &state_with(&["alpha"]));
+        let mut app = App::new(cfg.clone(), state::load(&cfg), true);
+
+        // A half-flushed .state must not blank the view.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(cfg.ctx_path.join(".state"), "{\"symbols\": {\"a\"").unwrap();
+
+        app.refresh();
+        assert_eq!(app.state.symbols.len(), 1, "torn read should keep the old state");
+    }
 }

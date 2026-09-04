@@ -1,7 +1,36 @@
-use super::ParsedSymbol;
+use super::{ParsedImport, ParsedSymbol};
 use regex::Regex;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+
+/// Extracts `use crate::a::b` and `mod a`. External crates are extracted too and
+/// drop out at resolution, same as Python's stdlib imports.
+pub fn extract_imports(src: &str) -> Vec<ParsedImport> {
+    let use_re = Regex::new(r"^\s*(?:pub\s+)?use\s+([\w:]+)").unwrap();
+    let mod_re = Regex::new(r"^\s*(?:pub\s+)?mod\s+(\w+)\s*;").unwrap();
+    let mut imports = Vec::new();
+
+    for line in src.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+
+        if let Some(caps) = mod_re.captures(trimmed) {
+            imports.push(ParsedImport {
+                source: caps[1].to_string(),
+                names: Vec::new(),
+            });
+        } else if let Some(caps) = use_re.captures(trimmed) {
+            imports.push(ParsedImport {
+                source: caps[1].trim_end_matches(':').to_string(),
+                names: Vec::new(),
+            });
+        }
+    }
+
+    imports
+}
 
 pub fn extract_symbols(src: &str) -> Vec<ParsedSymbol> {
     let mut raw_symbols = Vec::new();

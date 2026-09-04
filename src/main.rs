@@ -9,6 +9,7 @@ mod rate;
 mod resolver;
 mod rippler;
 mod state;
+mod trails;
 mod view;
 mod walker;
 mod watcher;
@@ -217,7 +218,7 @@ fn cmd_view(root: PathBuf) {
     };
 
     let st = state::load(&cfg);
-    view::render_view(&st, running);
+    view::render_view(&cfg, &st, running);
 }
 
 fn cmd_log(root: PathBuf, limit: usize) {
@@ -230,6 +231,7 @@ fn cmd_log(root: PathBuf, limit: usize) {
     }
 
     let st = state::load(&cfg);
+    let worker_trails = trails::load(&cfg);
     let start = if st.log.len() > limit { st.log.len() - limit } else { 0 };
 
     for entry in &st.log[start..] {
@@ -237,15 +239,14 @@ fn cmd_log(root: PathBuf, limit: usize) {
             .map(|d| d.format("%m-%dT%H:%M").to_string())
             .unwrap_or_default();
         let dots = trail_dots(entry.trail_strength);
-        println!("{} {} {} {} {}", dt, entry.op, entry.path, entry.detail, dots);
+        let who = trails::attribute(&worker_trails, &entry.path, entry.timestamp)
+            .map(|w| format!(" <{}>", w))
+            .unwrap_or_default();
+        println!("{} {} {} {} {}{}", dt, entry.op, entry.path, entry.detail, dots, who);
     }
 }
 
-fn trail_dots(strength: f64) -> String {
-    let filled = (strength * 5.0).min(5.0) as usize;
-    let empty = 5 - filled;
-    format!("{}{}", "●".repeat(filled), "○".repeat(empty))
-}
+use crate::view::trail_dots;
 
 fn cmd_brief(root: PathBuf, file: PathBuf, budget: usize) {
     let cfg = config::CtxConfig::new(root.clone());
@@ -456,14 +457,13 @@ fn cmd_touch(root: PathBuf, files: Vec<PathBuf>, worker: Option<String>) {
         std::process::exit(1);
     }
 
-    let trails_dir = ctx_dir.join("trails");
-    std::fs::create_dir_all(&trails_dir).expect("failed to create .ctx/trails/");
-
     let now = chrono::Utc::now();
     let worker_id = worker.unwrap_or_else(|| format!("worker-{}", now.timestamp_millis() % 10000));
 
-    // Load state and process each file
-    let mut st = state::load(&cfg);
+    // Read-only: the daemon owns .state and already saw these writes via fs
+    // events. All this command contributes is the identity behind them.
+    let st = state::load(&cfg);
+    let mut arch_paths = Vec::new();
     let mut touched_symbols = Vec::new();
     let mut rippled_all = Vec::new();
 
@@ -474,17 +474,17 @@ fn cmd_touch(root: PathBuf, files: Vec<PathBuf>, worker: Option<String>) {
             root.join(file)
         };
 
-        // Re-parse the file to pick up new/changed symbols
-        engine::process_file_change(&cfg, &mut st, &abs_file);
+        let arch = trails::arch_path_of(&abs_file, &root);
+        if !arch_paths.contains(&arch) {
+            arch_paths.push(arch);
+        }
 
-        // Collect symbols in this file
         let syms: Vec<String> = st.symbols.values()
             .filter(|s| s.file == abs_file)
             .map(|s| s.fqn.clone())
             .collect();
         touched_symbols.extend(syms);
 
-        // Get what rippled
         let dependents = st.graph.transitive_dependents(&abs_file, cfg.max_ripple_depth);
         for (dep, _) in &dependents {
             let rel = dep.strip_prefix(&root).unwrap_or(dep).display().to_string();
@@ -494,30 +494,24 @@ fn cmd_touch(root: PathBuf, files: Vec<PathBuf>, worker: Option<String>) {
         }
     }
 
-    // Save updated state
-    state::save(&cfg, &st);
-    writer::write_project_ctx(&cfg, &st);
+    let trail = trails::Trail {
+        worker: worker_id.clone(),
+        timestamp: now.timestamp(),
+        arch_paths,
+        files: files.iter().map(|f| f.display().to_string()).collect(),
+    };
 
-    // Write trail file
-    let trail = serde_json::json!({
-        "worker": worker_id,
-        "timestamp": now.to_rfc3339(),
-        "files": files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>(),
-        "symbols_touched": touched_symbols,
-        "rippled_to": rippled_all,
-    });
+    if let Err(e) = trails::append(&cfg, &trail) {
+        eprintln!("failed to record trail: {}", e);
+        std::process::exit(1);
+    }
 
-    let trail_file = trails_dir.join(format!("{}.json", worker_id));
-    std::fs::write(&trail_file, serde_json::to_string_pretty(&trail).unwrap())
-        .expect("failed to write trail");
-
-    // Print summary
     println!("trail: {}", worker_id);
     println!("  touched: {} files, {} symbols", files.len(), touched_symbols.len());
     if !rippled_all.is_empty() {
         println!("  rippled to: {}", rippled_all.join(", "));
     }
-    println!("  saved: {}", trail_file.strip_prefix(&root).unwrap_or(&trail_file).display());
+    println!("  saved: .ctx/trails.jsonl");
 }
 
 fn is_process_alive(pid: i32) -> bool {

@@ -32,6 +32,10 @@ pub fn extract_symbols(src: &str, path: &Path) -> Vec<ParsedSymbol> {
 pub fn extract_imports(src: &str, path: &Path) -> Vec<ParsedImport> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("ts") | Some("tsx") | Some("js") | Some("jsx") => typescript::extract_imports(src),
+        Some("py") => python::extract_imports(src),
+        Some("rs") => rust::extract_imports(src),
+        // ponytail: Go needs go.mod to map an import path to a directory.
+        // Add it when a Go project is actually tracked.
         _ => Vec::new(),
     }
 }

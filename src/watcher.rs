@@ -1,5 +1,5 @@
 use crate::config::CtxConfig;
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecommendedWatcher};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;

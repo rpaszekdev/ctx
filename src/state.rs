@@ -180,16 +180,21 @@ pub fn save(cfg: &CtxConfig, state: &CtxState) {
     std::fs::write(path, json).expect("failed to write .state");
 }
 
-pub fn load(cfg: &CtxConfig) -> CtxState {
-    let path = cfg.ctx_path.join(".state");
-    let mut state = if path.exists() {
-        let json = std::fs::read_to_string(path).expect("failed to read .state");
-        serde_json::from_str(&json).unwrap_or_else(|_| CtxState::new())
-    } else {
-        CtxState::new()
-    };
+/// Load state, or None if `.state` is missing, unreadable, or mid-write.
+/// Callers that already hold a state should keep it rather than blanking it.
+pub fn try_load(cfg: &CtxConfig) -> Option<CtxState> {
+    let json = std::fs::read_to_string(cfg.ctx_path.join(".state")).ok()?;
+    let mut state: CtxState = serde_json::from_str(&json).ok()?;
     state.nest = load_nest(cfg);
-    state
+    Some(state)
+}
+
+pub fn load(cfg: &CtxConfig) -> CtxState {
+    try_load(cfg).unwrap_or_else(|| {
+        let mut state = CtxState::new();
+        state.nest = load_nest(cfg);
+        state
+    })
 }
 
 pub fn load_nest(cfg: &CtxConfig) -> String {
